@@ -2,6 +2,7 @@ import multiprocessing
 import time
 import logging
 import json
+import importlib
 
 from redis import Redis
 
@@ -104,7 +105,7 @@ class RQ(object):
         logging.info("task_key=%s, task_info=%s", task_key, task_info)
         task_info: dict = json.loads(task_info)
 
-        module = __import__(task_info['module'], globals(), locals())
+        module = importlib.import_module(task_info['module'])
         func_name = task_info['name']
         a = task_info['a']
         kw = task_info['kw']
