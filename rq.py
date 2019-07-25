@@ -3,6 +3,7 @@ import time
 import logging
 import json
 import importlib
+from types import FunctionType
 
 from redis import Redis
 
@@ -23,6 +24,37 @@ def set_redis_url(url: str):
 2. 任务相关参数，值类型为 json 字符串，包含 module、 name、a、kw 几个字段；key 的格式：[queue]:task:[id]；过期时间 7 天
 3. 任务队列，key 的格式：[queue]:tq，值类型为 list，任务进队列 LPUSH，任务出队列 RPOP
 '''
+
+class AdditionalEnDecoder(object):
+
+    @classmethod
+    def _serialize_func(cls, func):
+        return {
+                '__type__': 'function',
+                '__module__': func.__module__,
+                '__name__': func.__name__,
+            }
+
+    @classmethod
+    def encode(cls, obj):
+        if isinstance(obj, FunctionType):
+            return cls._serialize_func(obj)
+        return obj
+
+    @classmethod
+    def _deserialize_func(cls, meta):
+        module = importlib.import_module(meta['__module__'])
+        name = meta['__name__']
+        if hasattr(module, name):
+            return getattr(module, name)
+        raise Exception('Can not find function {}.{}'.format(meta['__module__'], name))
+
+    @classmethod
+    def decode(cls, obj):
+        if isinstance(obj, dict) and '__type__' in obj and '__module__' in obj and '__name__' in obj:
+            if obj['__type__'] == 'function':
+                return cls._deserialize_func(obj)
+        return obj
 
 
 class AsyncTask(object):
@@ -46,11 +78,15 @@ class AsyncTask(object):
 
         task_id = self._redis.incr(self._counter_key)
         task_key = '{}:task:{}'.format(self._queue, task_id)
+
+        # WARNING: 由于 json 模块只支持 dict, list, tuple, str, int, float, True, False, None 的序列化反序列化，
+        # 所以默认函数的参数不能支持此外的类型
+        # 目前实现了自定义简单的函数参数序列化反序列化，不过还是慎用复杂的函数参数
         task_info = json.dumps({
             'module': self._func_module,
             'name': self._func_name,
-            'a': a,
-            'kw': kw
+            'a': [AdditionalEnDecoder.encode(item) for item in a],
+            'kw': dict([(k, AdditionalEnDecoder.encode(v)) for k, v in kw.items()])
         })
         self._redis.setex(task_key, AsyncTask.expire_seconds, task_info)
         self._redis.lpush(self._task_queue_key, task_key)
@@ -109,7 +145,8 @@ class RQ(object):
         func_name = task_info['name']
         a = task_info['a']
         kw = task_info['kw']
-
+        a = [AdditionalEnDecoder.decode(item) for item in a]
+        kw = dict([(k, AdditionalEnDecoder.decode(v)) for k, v in kw.items()])
         if hasattr(module, func_name):
             getattr(module, func_name)(*a, **kw)
         else:
@@ -136,16 +173,19 @@ if __name__ == '__main__':
 
     set_redis_url('redis://127.0.0.1:6379/8')
 
-    def hello(name: str, **kw):
+    def callback(name: str):
+        logging.info("{} in callback".format(name))
+    def hello(name: str, callback, **kw):
         logging.info("Hello {}, kw={}".format(name, kw))
+        callback(name)
 
     rq = RQ('test_queue', _redis_url)
     rq.start()
     logging.info('rq started!')
     hello = async_task("test_queue")(hello)
-    hello.send('xiayf')
+    hello.send('xiayf', callback)
     logging.info('hello.send(\'xiayf\')')
-    hello.send('zhengqing')
+    hello.send('zhengqing', callback)
     logging.info('hello.send(\'zhengqing\')')
-    hello.send('world', a=1)
+    hello.send('world', callback, a=1, cb=callback)
     logging.info('hello.send(\'world\', a=1)')
